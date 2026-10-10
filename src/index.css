@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-50: #ecfdf5;
+  --color-brand-100: #d1fae5;
+  --color-brand-500: #10b981;
+  --color-brand-600: #059669;
+  --color-brand-700: #047857;
+}
+
+@layer base {
+  html, body, #root { height: 100%; }
+  body { @apply bg-slate-100 text-slate-900 antialiased; -webkit-tap-highlight-color: transparent; }
+  input, select, textarea { font-size: 16px; } /* prevent iOS zoom on focus */
+}
+
+@utility btn { @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 font-medium transition active:scale-[.98] disabled:opacity-50 disabled:pointer-events-none; }
+@utility btn-primary { @apply btn bg-brand-600 text-white hover:bg-brand-700; }
+@utility btn-secondary { @apply btn bg-white text-slate-700 ring-1 ring-slate-300 hover:bg-slate-50; }
+@utility btn-danger { @apply btn bg-red-600 text-white hover:bg-red-700; }
+@utility input { @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100; }
+@utility label { @apply mb-1 block text-sm font-medium text-slate-600; }
+@utility card { @apply rounded-xl bg-white shadow-sm ring-1 ring-slate-200; }
+
+/* Thermal receipt printing (58mm). Only .print-area is printed. */
+@media print {
+  @page { size: 58mm auto; margin: 0; }
+  body { background: white; }
+  body * { visibility: hidden; }
+  .print-area, .print-area * { visibility: visible; }
+  .print-area { position: absolute; left: 0; top: 0; width: 58mm; padding: 2mm; font-size: 11px; }
+}
