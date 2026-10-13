@@ -1,10 +1,16 @@
-import { useRef, useState } from 'react'
-import { useLiveQuery } from 'dexie-react-hooks'
-import { db, exportBackup, getSettings, importBackup, loadSampleProducts, saveSettings, type StoreSettings } from '../lib/db'
+import { useEffect, useRef, useState } from 'react'
+import { signOut } from 'firebase/auth'
+import { limit, query } from 'firebase/firestore'
+import { exportBackup, getSettings, importBackup, loadSampleProducts, saveSettings, type Product, type StoreSettings } from '../lib/db'
+import { auth, col, isGuest, setGuest } from '../lib/firebase'
+import { useCollection } from '../lib/hooks'
 
 export default function SettingsPage() {
   // Read once, then let the form own its state.
-  const initial = useLiveQuery(() => getSettings(), [])
+  const [initial, setInitial] = useState<StoreSettings>()
+  useEffect(() => {
+    getSettings().then(setInitial)
+  }, [])
   return initial ? <SettingsForm initial={initial} /> : null
 }
 
@@ -13,15 +19,14 @@ function SettingsForm({ initial }: { initial: StoreSettings }) {
   const [saved, setSaved] = useState(false)
   const [message, setMessage] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
-  const productCount = useLiveQuery(() => db.products.count(), []) ?? 0
+  const anyProduct = useCollection<Product>(() => query(col('products'), limit(1)), [])
+  const noProducts = anyProduct !== undefined && anyProduct.length === 0
 
   const set = <K extends keyof StoreSettings>(k: K, v: StoreSettings[K]) => setForm((f) => ({ ...f, [k]: v }))
 
   const save = async (e: React.FormEvent) => {
     e.preventDefault()
-    const { nextReceiptNo, ...rest } = form // receipt counter is owned by checkout
-    void nextReceiptNo
-    await saveSettings(rest)
+    saveSettings(form)
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
   }
@@ -39,11 +44,10 @@ function SettingsForm({ initial }: { initial: StoreSettings }) {
   }
 
   const restore = async (file: File) => {
-    if (!confirm('This will replace ALL current data. Continue?')) return
+    if (!confirm('Records in the backup will be added to the shared database, replacing any with the same ID. Continue?')) return
     try {
-      await importBackup(JSON.parse(await file.text()))
-      setMessage('Backup restored.')
-      location.reload()
+      const count = importBackup(JSON.parse(await file.text()))
+      setMessage(`Imported ${count} records. They will appear on all devices once synced.`)
     } catch (e) {
       setMessage(`Error: ${(e as Error).message}`)
     }
@@ -81,18 +85,28 @@ function SettingsForm({ initial }: { initial: StoreSettings }) {
           <input type="checkbox" className="h-4 w-4" checked={form.vatRegistered} onChange={(e) => set('vatRegistered', e.target.checked)} />
           Store is VAT-registered
         </label>
+        <div>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" className="h-4 w-4" checked={form.allowOversell} onChange={(e) => set('allowOversell', e.target.checked)} />
+            Allow selling when out of stock
+          </label>
+          <p className="mt-1 ml-6 text-xs text-slate-500">
+            The cashier still gets a warning, but the sale goes through and stock goes negative. Use this if stock counts aren't always updated.
+          </p>
+        </div>
         <button className="btn-primary w-full sm:w-auto">{saved ? 'Saved ✓' : 'Save'}</button>
       </form>
 
       <section className="card space-y-3 p-4">
-        <h2 className="font-semibold">Backup at Restore</h2>
+        <h2 className="font-semibold">Backup and Restore</h2>
         <p className="text-sm text-slate-600">
-          All data is saved on this device only. Back up regularly (e.g. weekly) and keep the file somewhere else — Google Drive, Messenger, or a USB drive.
+          Data is kept in the shared online database and synced to every signed-in device. A backup file is still a good safety net — download one now and then
+          and keep it somewhere safe. You can also import a backup from the older on-device version of the app.
         </p>
         <p className="text-xs text-slate-500">Last backup: {lastBackup ? new Date(lastBackup).toLocaleString('en-PH') : 'never'}</p>
         <div className="flex flex-wrap gap-2">
           <button className="btn-primary" onClick={download}>Download backup</button>
-          <button className="btn-secondary" onClick={() => fileRef.current?.click()}>Restore from file</button>
+          <button className="btn-secondary" onClick={() => fileRef.current?.click()}>Import backup file</button>
           <input
             ref={fileRef}
             type="file"
@@ -108,15 +122,31 @@ function SettingsForm({ initial }: { initial: StoreSettings }) {
         {message && <p className="text-sm text-brand-700">{message}</p>}
       </section>
 
-      {productCount === 0 && (
+      {noProducts && (
         <section className="card space-y-3 p-4">
           <h2 className="font-semibold">Sample data</h2>
           <p className="text-sm text-slate-600">Load example products to try out the system.</p>
-          <button className="btn-secondary" onClick={() => loadSampleProducts().then(() => setMessage('Sample products loaded.'))}>
+          <button className="btn-secondary" onClick={() => { loadSampleProducts(); setMessage('Sample products loaded.') }}>
             Load sample products
           </button>
         </section>
       )}
+
+      <section className="card flex flex-wrap items-center justify-between gap-3 p-4">
+        <div>
+          <h2 className="font-semibold">Account</h2>
+          <p className="text-sm text-slate-600">{isGuest ? 'Guest mode (demo data)' : `Signed in as ${auth.currentUser?.email}`}</p>
+        </div>
+        {isGuest ? (
+          <button className="btn-secondary" onClick={() => setGuest(false)}>
+            Exit guest mode
+          </button>
+        ) : (
+          <button className="btn-secondary" onClick={() => confirm('Sign out of this device?') && signOut(auth)}>
+            Sign out
+          </button>
+        )}
+      </section>
     </div>
   )
 }

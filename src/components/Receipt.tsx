@@ -1,16 +1,17 @@
 import type { Sale } from '../lib/db'
 import { formatPeso, formatQty, lineTotal } from '../lib/money'
 import { formatDateTime } from '../lib/dates'
-import { useSettings } from '../lib/hooks'
-import { useLiveQuery } from 'dexie-react-hooks'
-import { db } from '../lib/db'
+import { useDocument, useSettings } from '../lib/hooks'
+import { doc } from 'firebase/firestore'
+import { col } from '../lib/firebase'
+import type { Customer } from '../lib/db'
 
 const paymentLabel = { cash: 'Cash', gcash: 'GCash', maya: 'Maya', utang: 'Credit' }
 const discountLabel = { none: '', senior: 'Senior Citizen', pwd: 'PWD', custom: 'Discount' }
 
 export default function Receipt({ sale }: { sale: Sale }) {
   const s = useSettings()
-  const customer = useLiveQuery(() => (sale.customerId ? db.customers.get(sale.customerId) : undefined), [sale.customerId])
+  const customer = useDocument<Customer>(() => (sale.customerId ? doc(col('customers'), sale.customerId) : null), [sale.customerId])
 
   return (
     <div className="print-area mx-auto w-full max-w-[300px] font-mono text-xs leading-relaxed text-black">

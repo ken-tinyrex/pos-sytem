@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react'
-import { useLiveQuery } from 'dexie-react-hooks'
-import { db, type PaymentMethod } from '../lib/db'
+import { query, where } from 'firebase/firestore'
+import { type PaymentMethod, type Product, type Sale } from '../lib/db'
+import { col } from '../lib/firebase'
+import { useCollection } from '../lib/hooks'
 import { formatPeso, formatQty, lineTotal } from '../lib/money'
 import { endOfDay, fromDateInput, startOfDay, toDateInput } from '../lib/dates'
 
@@ -27,17 +29,14 @@ export default function ReportsPage() {
   const [preset, setPreset] = useState<Preset>('today')
   const [[from, to], setRange] = useState(presetRange('today'))
 
-  const sales =
-    useLiveQuery(
-      () =>
-        db.sales
-          .where('createdAt')
-          .between(startOfDay(fromDateInput(from)), endOfDay(fromDateInput(to)), true, true)
-          .filter((s) => s.status === 'completed')
-          .toArray(),
-      [from, to],
-    ) ?? []
-  const lowStock = useLiveQuery(() => db.products.where('active').equals(1).filter((p) => p.stock <= p.lowStock).toArray(), []) ?? []
+  const rangeSales = useCollection<Sale>(
+    () =>
+      query(col('sales'), where('createdAt', '>=', startOfDay(fromDateInput(from))), where('createdAt', '<=', endOfDay(fromDateInput(to)))),
+    [from, to],
+  )
+  const sales = useMemo(() => (rangeSales ?? []).filter((s) => s.status === 'completed'), [rangeSales])
+  const products = useCollection<Product>(() => query(col('products'), where('active', '==', true)), [])
+  const lowStock = (products ?? []).filter((p) => p.stock <= p.lowStock).sort((a, b) => a.stock - b.stock)
 
   const stats = useMemo(() => {
     let gross = 0

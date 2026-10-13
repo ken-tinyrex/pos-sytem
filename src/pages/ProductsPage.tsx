@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react'
-import { useLiveQuery } from 'dexie-react-hooks'
-import { adjustStock, db, type Product } from '../lib/db'
+import { doc, limit, orderBy, query as fsQuery, where } from 'firebase/firestore'
+import { adjustStock, createProduct, updateProduct, type Product, type StockMove } from '../lib/db'
+import { col } from '../lib/firebase'
+import { useCollection, useDocument } from '../lib/hooks'
 import { formatPeso, formatQty, toCentavos, toPesos } from '../lib/money'
 import Icon from '../components/Icon'
 import Modal from '../components/Modal'
@@ -9,7 +11,8 @@ import CameraScanner, { cameraScanSupported } from '../components/CameraScanner'
 type Filter = 'all' | 'low' | 'archived'
 
 export default function ProductsPage() {
-  const products = useLiveQuery(() => db.products.orderBy('name').toArray(), []) ?? []
+  const allProducts = useCollection<Product>(() => col('products'), [])
+  const products = useMemo(() => [...(allProducts ?? [])].sort((a, b) => a.name.localeCompare(b.name)), [allProducts])
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<Filter>('all')
   const [editing, setEditing] = useState<Product | 'new' | null>(null)
@@ -113,7 +116,7 @@ export default function ProductsPage() {
         {shown.length === 0 && <p className="p-8 text-center text-slate-400">No products</p>}
       </ul>
 
-      <ProductForm product={editing} categories={categories} onClose={() => setEditing(null)} />
+      <ProductForm product={editing} products={products} categories={categories} onClose={() => setEditing(null)} />
       <StockModal product={stocking} onClose={() => setStocking(null)} />
     </div>
   )
@@ -121,18 +124,24 @@ export default function ProductsPage() {
 
 const units = ['pc', 'pack', 'sachet', 'can', 'bottle', 'box', 'kg', 'g', 'L', 'ml', 'dozen', 'tray']
 
-function ProductForm({ product, categories, onClose }: { product: Product | 'new' | null; categories: string[]; onClose: () => void }) {
+interface FormProps {
+  products: Product[]
+  categories: string[]
+  onClose: () => void
+}
+
+function ProductForm({ product, ...rest }: FormProps & { product: Product | 'new' | null }) {
   const isNew = product === 'new'
   const p = product && product !== 'new' ? product : null
   const key = isNew ? 'new' : p?.id
   return (
-    <Modal open={!!product} onClose={onClose} title={isNew ? 'New product' : 'Edit product'}>
-      {product && <ProductFormBody key={key} product={p} categories={categories} onClose={onClose} />}
+    <Modal open={!!product} onClose={rest.onClose} title={isNew ? 'New product' : 'Edit product'}>
+      {product && <ProductFormBody key={key} product={p} {...rest} />}
     </Modal>
   )
 }
 
-function ProductFormBody({ product, categories, onClose }: { product: Product | null; categories: string[]; onClose: () => void }) {
+function ProductFormBody({ product, products, categories, onClose }: FormProps & { product: Product | null }) {
   const [form, setForm] = useState({
     name: product?.name ?? '',
     barcode: product?.barcode ?? '',
@@ -151,15 +160,14 @@ function ProductFormBody({ product, categories, onClose }: { product: Product | 
   const cost = toCentavos(form.cost)
   const margin = price > 0 && cost > 0 ? Math.round(((price - cost) / price) * 100) : null
 
-  const save = async (e: React.FormEvent) => {
+  const save = (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
     const barcode = form.barcode.trim()
     if (barcode) {
-      const dupe = await db.products.where('barcode').equals(barcode).first()
-      if (dupe && dupe.id !== product?.id) return setError(`Barcode is already used by "${dupe.name}".`)
+      const dupe = products.find((p) => p.barcode === barcode && p.id !== product?.id)
+      if (dupe) return setError(`Barcode is already used by "${dupe.name}".`)
     }
-    const now = Date.now()
     const data = {
       name: form.name.trim(),
       barcode,
@@ -168,20 +176,14 @@ function ProductFormBody({ product, categories, onClose }: { product: Product | 
       price,
       cost,
       lowStock: Number(form.lowStock) || 0,
-      updatedAt: now,
     }
-    if (product) {
-      await db.products.update(product.id!, data)
-    } else {
-      const stock = Number(form.stock) || 0
-      const id = await db.products.add({ ...data, stock, active: 1, createdAt: now })
-      if (stock) await db.stockMoves.add({ productId: id!, createdAt: now, qty: stock, reason: 'restock', note: 'Initial stock' })
-    }
+    if (product) updateProduct(product.id, data)
+    else createProduct(data, Number(form.stock) || 0)
     onClose()
   }
 
-  const toggleArchive = async () => {
-    await db.products.update(product!.id!, { active: product!.active ? 0 : 1 })
+  const toggleArchive = () => {
+    updateProduct(product!.id, { active: !product!.active })
     onClose()
   }
 
@@ -268,16 +270,20 @@ function StockBody({ product, onClose }: { product: Product; onClose: () => void
   const [mode, setMode] = useState<'restock' | 'adjust'>('restock')
   const [qty, setQty] = useState('')
   const [note, setNote] = useState('')
-  const moves = useLiveQuery(() => db.stockMoves.where('productId').equals(product.id!).reverse().limit(10).toArray(), [product.id]) ?? []
-  const live = useLiveQuery(() => db.products.get(product.id!), [product.id]) ?? product
+  const moves =
+    useCollection<StockMove>(
+      () => fsQuery(col('stockMoves'), where('productId', '==', product.id), orderBy('createdAt', 'desc'), limit(10)),
+      [product.id],
+    ) ?? []
+  const live = useDocument<Product>(() => doc(col('products'), product.id), [product.id]) ?? product
 
-  const save = async (e: React.FormEvent) => {
+  const save = (e: React.FormEvent) => {
     e.preventDefault()
     const n = Number(qty)
     if (!n) return
     // Restock adds; adjust sets the counted quantity (e.g. after inventory count).
     const delta = mode === 'restock' ? n : n - live.stock
-    if (delta) await adjustStock(product.id!, delta, mode, note.trim() || undefined)
+    if (delta) adjustStock(product.id, delta, mode, note.trim() || undefined)
     onClose()
   }
 

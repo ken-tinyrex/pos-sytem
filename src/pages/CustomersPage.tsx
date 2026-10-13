@@ -1,16 +1,18 @@
 import { useState } from 'react'
-import { useLiveQuery } from 'dexie-react-hooks'
-import { db, recordPayment, type Customer } from '../lib/db'
+import { doc, orderBy, query as fsQuery, where } from 'firebase/firestore'
+import { addCustomer, recordPayment, updateCustomer, type CreditEntry, type Customer } from '../lib/db'
+import { col } from '../lib/firebase'
+import { useCollection, useDocument } from '../lib/hooks'
 import { formatPeso, toCentavos } from '../lib/money'
 import { formatDateTime } from '../lib/dates'
 import Icon from '../components/Icon'
 import Modal from '../components/Modal'
 
 export default function CustomersPage() {
-  const customers = useLiveQuery(() => db.customers.orderBy('name').toArray(), []) ?? []
+  const customers = useCollection<Customer>(() => fsQuery(col('customers'), orderBy('name')), []) ?? []
   const [query, setQuery] = useState('')
   const [adding, setAdding] = useState(false)
-  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
 
   const shown = customers.filter((c) => c.name.toLowerCase().includes(query.trim().toLowerCase()))
   const totalOwed = customers.reduce((s, c) => s + Math.max(0, c.balance), 0)
@@ -38,7 +40,7 @@ export default function CustomersPage() {
         {shown.length === 0 && <li className="p-8 text-center text-slate-400">No customers</li>}
         {shown.map((c) => (
           <li key={c.id}>
-            <button className="flex w-full items-center justify-between px-4 py-3 text-left hover:bg-slate-50" onClick={() => setSelectedId(c.id!)}>
+            <button className="flex w-full items-center justify-between px-4 py-3 text-left hover:bg-slate-50" onClick={() => setSelectedId(c.id)}>
               <div>
                 <div className="font-medium">{c.name}</div>
                 {c.phone && <div className="text-xs text-slate-500">{c.phone}</div>}
@@ -64,8 +66,8 @@ function CustomerForm({ customer, onClose }: { customer?: Customer; onClose: () 
   const [phone, setPhone] = useState(customer?.phone ?? '')
   const save = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (customer) await db.customers.update(customer.id!, { name: name.trim(), phone: phone.trim() })
-    else await db.customers.add({ name: name.trim(), phone: phone.trim(), balance: 0, createdAt: Date.now() })
+    if (customer) updateCustomer(customer.id, { name: name.trim(), phone: phone.trim() })
+    else addCustomer(name.trim(), phone.trim())
     onClose()
   }
   return (
@@ -83,9 +85,10 @@ function CustomerForm({ customer, onClose }: { customer?: Customer; onClose: () 
   )
 }
 
-function CustomerDetail({ id }: { id: number }) {
-  const customer = useLiveQuery(() => db.customers.get(id), [id])
-  const entries = useLiveQuery(() => db.credits.where('customerId').equals(id).reverse().sortBy('createdAt'), [id]) ?? []
+function CustomerDetail({ id }: { id: string }) {
+  const customer = useDocument<Customer>(() => doc(col('customers'), id), [id])
+  const entries =
+    useCollection<CreditEntry>(() => fsQuery(col('credits'), where('customerId', '==', id), orderBy('createdAt', 'desc')), [id]) ?? []
   const [amount, setAmount] = useState('')
   const [editing, setEditing] = useState(false)
 
@@ -95,7 +98,7 @@ function CustomerDetail({ id }: { id: number }) {
     e.preventDefault()
     const cents = toCentavos(amount)
     if (cents <= 0) return
-    await recordPayment(id, cents, 'Payment')
+    recordPayment(id, cents, 'Payment')
     setAmount('')
   }
 

@@ -1,6 +1,7 @@
 import { NavLink, Outlet } from 'react-router-dom'
 import Icon, { type IconName } from './Icon'
-import { useOnline, useSettings } from '../lib/hooks'
+import { useOnline, useSettings, useSyncError } from '../lib/hooks'
+import { isGuest, setGuest } from '../lib/firebase'
 
 const nav: { to: string; label: string; icon: IconName }[] = [
   { to: '/', label: 'Sell', icon: 'cart' },
@@ -14,6 +15,7 @@ const nav: { to: string; label: string; icon: IconName }[] = [
 export default function Layout() {
   const online = useOnline()
   const { storeName } = useSettings()
+  const syncError = useSyncError()
 
   return (
     <div className="flex h-full flex-col md:flex-row">
@@ -50,6 +52,21 @@ export default function Layout() {
       </header>
 
       <main className="min-h-0 flex-1 overflow-y-auto">
+        {isGuest && (
+          <div className="flex items-center justify-between gap-2 bg-amber-100 px-4 py-1.5 text-sm text-amber-900 print:hidden">
+            <span>
+              <b>Guest demo</b> — shared test data, anyone with the link can see it.
+            </span>
+            <button className="shrink-0 font-semibold underline" onClick={() => setGuest(false)}>
+              Sign in
+            </button>
+          </div>
+        )}
+        {syncError && (
+          <div role="alert" className="bg-red-600 px-4 py-2 text-sm text-white print:hidden">
+            Could not save to the shared database: {syncError}
+          </div>
+        )}
         <Outlet />
       </main>
 
@@ -75,7 +92,7 @@ export default function Layout() {
 
 function OfflineBadge({ className = '' }: { className?: string }) {
   return (
-    <span className={`flex items-center gap-1 rounded-full bg-amber-500/20 px-2 py-1 text-xs text-amber-300 ${className}`} title="Still works offline">
+    <span className={`flex items-center gap-1 rounded-full bg-amber-500/20 px-2 py-1 text-xs text-amber-300 ${className}`} title="Changes are saved on this device and will sync when back online">
       <Icon name="wifiOff" className="h-4 w-4" /> Offline
     </span>
   )

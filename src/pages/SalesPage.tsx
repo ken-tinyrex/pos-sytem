@@ -1,6 +1,8 @@
 import { useState } from 'react'
-import { useLiveQuery } from 'dexie-react-hooks'
-import { db, voidSale, type Sale } from '../lib/db'
+import { doc, orderBy, query, where } from 'firebase/firestore'
+import { voidSale, type Sale } from '../lib/db'
+import { col } from '../lib/firebase'
+import { useCollection, useDocument } from '../lib/hooks'
 import { formatPeso } from '../lib/money'
 import { endOfDay, formatDateTime, fromDateInput, startOfDay, toDateInput } from '../lib/dates'
 import Icon from '../components/Icon'
@@ -19,7 +21,11 @@ export default function SalesPage() {
   const [selected, setSelected] = useState<Sale | null>(null)
   const day = fromDateInput(date)
   const sales =
-    useLiveQuery(() => db.sales.where('createdAt').between(startOfDay(day), endOfDay(day), true, true).reverse().toArray(), [date]) ?? []
+    useCollection<Sale>(
+      () =>
+        query(col('sales'), where('createdAt', '>=', startOfDay(day)), where('createdAt', '<=', endOfDay(day)), orderBy('createdAt', 'desc')),
+      [date],
+    ) ?? []
 
   const completed = sales.filter((s) => s.status === 'completed')
   const total = completed.reduce((s, x) => s + x.total, 0)
@@ -71,10 +77,10 @@ export default function SalesPage() {
 }
 
 function SaleDetail({ sale, onDone }: { sale: Sale; onDone: () => void }) {
-  const live = useLiveQuery(() => db.sales.get(sale.id!), [sale.id]) ?? sale
+  const live = useDocument<Sale>(() => doc(col('sales'), sale.id), [sale.id]) ?? sale
   const onVoid = async () => {
     if (!confirm(`Void receipt #${sale.receiptNo}? Stock will be returned${sale.payment === 'utang' ? ' and the credit balance reduced' : ''}.`)) return
-    await voidSale(sale.id!)
+    await voidSale(live)
     onDone()
   }
   return (

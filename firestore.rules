@@ -1,0 +1,17 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Kiko Store POS: only the store account (email + password sign-in) can read or write.
+    // New sign-ups are disabled in Firebase Auth, so accounts can only be created in the console.
+    match /stores/kiko/{document=**} {
+      allow read, write: if request.auth != null
+        && request.auth.token.firebase.sign_in_provider == 'password';
+    }
+    // Guest demo: open to anyone so the app can be tried without an account.
+    // Holds only test data; remove this block to turn guest mode off.
+    match /stores/demo/{document=**} {
+      allow read, write: if true;
+    }
+    // Everything else stays closed.
+  }
+}

@@ -6,8 +6,18 @@ import SalesPage from './pages/SalesPage'
 import CustomersPage from './pages/CustomersPage'
 import ReportsPage from './pages/ReportsPage'
 import SettingsPage from './pages/SettingsPage'
+import LoginPage from './pages/LoginPage'
+import { useAuthUser } from './lib/hooks'
+import { isGuest } from './lib/firebase'
 
 export default function App() {
+  const user = useAuthUser()
+  // Sign-in is remembered on the device, so this also works offline after the first login.
+  if (!isGuest) {
+    if (user === undefined) return null
+    if (user === null) return <LoginPage />
+  }
+
   return (
     <Routes>
       <Route element={<Layout />}>

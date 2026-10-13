@@ -1,12 +1,14 @@
-import { useMemo, useRef, useState } from 'react'
-import { useLiveQuery } from 'dexie-react-hooks'
-import { checkout, db, type DiscountType, type PaymentMethod, type Product, type Sale } from '../lib/db'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { orderBy, query as fsQuery, where } from 'firebase/firestore'
+import { addCustomer, checkout, type Customer, type DiscountType, type PaymentMethod, type Product, type Sale } from '../lib/db'
+import { col } from '../lib/firebase'
 import { formatPeso, formatQty, lineTotal, toCentavos } from '../lib/money'
-import { useSettings } from '../lib/hooks'
+import { useCollection, useSettings } from '../lib/hooks'
 import Icon from '../components/Icon'
 import Modal from '../components/Modal'
 import Receipt from '../components/Receipt'
 import CameraScanner, { cameraScanSupported } from '../components/CameraScanner'
+import { beep } from '../lib/beep'
 
 interface CartLine {
   product: Product
@@ -15,16 +17,31 @@ interface CartLine {
 
 const isFractionalUnit = (unit: string) => ['kg', 'g', 'l', 'liter', 'ml'].includes(unit.toLowerCase())
 
+const CAMERA_PREF_KEY = 'pos.cameraOn'
+const readCameraPref = () => {
+  try {
+    return localStorage.getItem(CAMERA_PREF_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+const isEditable = (el: Element | null) =>
+  el instanceof HTMLElement && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName))
+
 export default function PosPage() {
-  const products = useLiveQuery(() => db.products.where('active').equals(1).sortBy('name'), []) ?? []
+  const activeProducts = useCollection<Product>(() => fsQuery(col('products'), where('active', '==', true)), [])
+  const products = useMemo(() => [...(activeProducts ?? [])].sort((a, b) => a.name.localeCompare(b.name)), [activeProducts])
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState('')
   const [cart, setCart] = useState<CartLine[]>([])
   const [cartOpen, setCartOpen] = useState(false) // mobile sheet
   const [paying, setPaying] = useState(false)
-  const [scanning, setScanning] = useState(false)
+  const [cameraOn, setCameraOn] = useState(() => cameraScanSupported() && readCameraPref())
   const [lastSale, setLastSale] = useState<Sale | null>(null)
-  const [notice, setNotice] = useState('')
+  const { allowOversell } = useSettings()
+  const [notice, setNotice] = useState<{ msg: string; tone?: 'error' | 'warn' } | null>(null)
+  const noticeTimer = useRef<number>(undefined)
   const searchRef = useRef<HTMLInputElement>(null)
 
   const categories = useMemo(() => [...new Set(products.map((p) => p.category).filter(Boolean))].sort(), [products])
@@ -39,41 +56,120 @@ export default function PosPage() {
   const subtotal = cart.reduce((s, l) => s + lineTotal(l.product.price, l.qty), 0)
   const itemCount = cart.reduce((s, l) => s + (isFractionalUnit(l.product.unit) ? 1 : l.qty), 0)
 
-  const flash = (msg: string) => {
-    setNotice(msg)
-    window.setTimeout(() => setNotice(''), 2000)
+  const flash = (msg: string, tone?: 'error' | 'warn') => {
+    setNotice({ msg, tone })
+    clearTimeout(noticeTimer.current)
+    noticeTimer.current = window.setTimeout(() => setNotice(null), tone ? 3500 : 2000)
   }
 
+  // Live stock levels, so the cart can't hold more than what's on the shelf
+  // (unless overselling is allowed in Settings, then it only warns).
+  const stockById = useMemo(() => new Map(products.map((p) => [p.id, p.stock])), [products])
+  const stockOf = (id: string) => stockById.get(id) ?? 0
+
+  const warnStock = (product: Product) => {
+    const stock = stockOf(product.id)
+    beep(false)
+    navigator.vibrate?.([60, 40, 60])
+    if (allowOversell) {
+      flash(`Over recorded stock (${formatQty(stock)} ${product.unit}) for ${product.name} — please recount`, 'warn')
+    } else {
+      flash(
+        stock <= 0 ? `${product.name} is out of stock` : `No more stock — only ${formatQty(stock)} ${product.unit} of ${product.name} available`,
+        'error',
+      )
+    }
+  }
+
+  /** Returns false (and warns) when there isn't enough stock and overselling is off. */
   const addToCart = (product: Product, qty = 1) => {
+    const inCart = cart.find((l) => l.product.id === product.id)?.qty ?? 0
+    if (inCart + qty > stockOf(product.id)) {
+      warnStock(product)
+      if (!allowOversell) return false
+    }
     setCart((c) => {
       const existing = c.find((l) => l.product.id === product.id)
-      if (existing) return c.map((l) => (l === existing ? { ...l, qty: l.qty + qty } : l))
+      if (existing) return c.map((l) => (l === existing ? { ...l, qty: +(l.qty + qty).toFixed(3) } : l))
       return [...c, { product, qty }]
     })
+    return true
   }
 
-  const setQty = (id: number, qty: number) =>
+  const setQty = (id: string, qty: number) => {
+    const line = cart.find((l) => l.product.id === id)
+    if (line && qty > stockOf(id) && qty > line.qty) {
+      warnStock(line.product)
+      if (!allowOversell) qty = Math.max(0, stockOf(id))
+    }
     setCart((c) => (qty <= 0 ? c.filter((l) => l.product.id !== id) : c.map((l) => (l.product.id === id ? { ...l, qty } : l))))
+  }
 
   const addByCode = (code: string) => {
     const match = products.find((p) => p.barcode && p.barcode === code.trim())
     if (match) {
-      addToCart(match)
-      flash(`+ ${match.name}`)
+      if (addToCart(match)) {
+        flash(`+ ${match.name}`)
+        beep()
+      }
       return true
     }
     return false
   }
+
+  const onScanned = (code: string) => {
+    if (paying) return
+    setLastSale(null) // a scan on the receipt screen starts the next sale
+    if (!addByCode(code)) {
+      beep(false)
+      flash(`No product with barcode ${code}`, 'error')
+    }
+  }
+
+  const toggleCamera = () => {
+    const next = !cameraOn
+    setCameraOn(next)
+    try {
+      localStorage.setItem(CAMERA_PREF_KEY, next ? '1' : '0')
+    } catch {
+      /* storage unavailable */
+    }
+  }
+
+  // Hardware scanners type the code very fast and end with Enter. Catch that anywhere
+  // on this page (not just in the search box), as long as the user isn't typing in a field.
+  const onScannedRef = useRef(onScanned)
+  onScannedRef.current = onScanned
+  useEffect(() => {
+    let buffer = ''
+    let lastKey = 0
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey || isEditable(document.activeElement)) return
+      const now = performance.now()
+      if (now - lastKey > 50) buffer = '' // human typing speed: start over
+      lastKey = now
+      if (e.key === 'Enter') {
+        if (buffer.length >= 4) {
+          e.preventDefault()
+          onScannedRef.current(buffer)
+        }
+        buffer = ''
+      } else if (e.key.length === 1) {
+        buffer += e.key
+      }
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [])
 
   // USB/Bluetooth barcode scanners type the code then press Enter.
   const onSearchEnter = () => {
     if (!query.trim()) return
     if (addByCode(query)) return setQuery('')
     if (filtered.length === 1) {
-      addToCart(filtered[0])
-      flash(`+ ${filtered[0].name}`)
+      if (addToCart(filtered[0])) flash(`+ ${filtered[0].name}`)
       setQuery('')
-    } else if (filtered.length === 0) flash('No product found')
+    } else if (filtered.length === 0) flash('No product found', 'error')
   }
 
   const onPaid = (sale: Sale) => {
@@ -87,6 +183,8 @@ export default function PosPage() {
     <CartPanel
       cart={cart}
       subtotal={subtotal}
+      stockOf={stockOf}
+      allowOversell={allowOversell}
       onQty={setQty}
       onClear={() => setCart([])}
       onPay={() => setPaying(true)}
@@ -112,11 +210,22 @@ export default function PosPage() {
               />
             </div>
             {cameraScanSupported() && (
-              <button className="btn-secondary px-3" onClick={() => setScanning(true)} aria-label="Scan with camera">
+              <button
+                className={cameraOn ? 'btn-primary px-3' : 'btn-secondary px-3'}
+                onClick={toggleCamera}
+                aria-label={cameraOn ? 'Turn off camera scanner' : 'Turn on camera scanner'}
+                aria-pressed={cameraOn}
+              >
                 <Icon name="scan" />
               </button>
             )}
           </div>
+          {cameraOn && (
+            <div className="relative">
+              <CameraScanner continuous onDetected={onScanned} className="h-36 sm:h-48" />
+              <span className="absolute top-2 left-2 rounded-full bg-black/60 px-2 py-0.5 text-xs text-white">Scanning…</span>
+            </div>
+          )}
           {categories.length > 0 && (
             <div className="-mx-3 flex gap-2 overflow-x-auto px-3 pb-1">
               <Chip active={!category} onClick={() => setCategory('')}>All</Chip>
@@ -134,11 +243,12 @@ export default function PosPage() {
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
               {filtered.map((p) => {
                 const inCart = cart.find((l) => l.product.id === p.id)
+                const out = p.stock <= 0
                 return (
                   <button
                     key={p.id}
                     onClick={() => addToCart(p)}
-                    className={`card relative flex min-h-24 flex-col justify-between p-3 text-left transition hover:ring-brand-500 active:scale-[.98] ${inCart ? 'ring-2 ring-brand-500' : ''}`}
+                    className={`card relative flex min-h-24 flex-col justify-between p-3 text-left transition hover:ring-brand-500 active:scale-[.98] ${inCart ? 'ring-2 ring-brand-500' : ''} ${out ? 'opacity-50' : ''}`}
                   >
                     {inCart && (
                       <span className="absolute -top-2 -right-2 rounded-full bg-brand-600 px-2 py-0.5 text-xs font-bold text-white">
@@ -149,7 +259,7 @@ export default function PosPage() {
                     <span className="mt-2 flex items-end justify-between gap-1">
                       <span className="font-bold text-brand-700">{formatPeso(p.price)}</span>
                       <span className={`text-xs ${p.stock <= p.lowStock ? 'font-semibold text-red-600' : 'text-slate-400'}`}>
-                        {formatQty(p.stock)} {p.unit}
+                        {out ? 'Out of stock' : `${formatQty(p.stock)} ${p.unit}`}
                       </span>
                     </span>
                   </button>
@@ -187,19 +297,16 @@ export default function PosPage() {
       )}
 
       {notice && (
-        <div className="fixed top-16 left-1/2 z-50 -translate-x-1/2 rounded-full bg-slate-900 px-4 py-2 text-sm text-white shadow-lg md:top-4">
-          {notice}
+        <div
+          role={notice.tone ? 'alert' : 'status'}
+          className={`fixed top-16 left-1/2 z-50 w-max max-w-[calc(100%-2rem)] -translate-x-1/2 rounded-xl px-4 py-2.5 text-center text-sm text-white shadow-lg md:top-4 ${
+            notice.tone === 'error' ? 'bg-red-600 font-semibold' : notice.tone === 'warn' ? 'bg-amber-500 font-semibold' : 'bg-slate-900'
+          }`}
+        >
+          {notice.tone && '⚠ '}
+          {notice.msg}
         </div>
       )}
-
-      <Modal open={scanning} onClose={() => setScanning(false)} title="Scan barcode" size="sm">
-        <CameraScanner
-          onDetected={(code) => {
-            setScanning(false)
-            if (!addByCode(code)) flash(`No product with barcode ${code}`)
-          }}
-        />
-      </Modal>
 
       <PaymentModal open={paying} onClose={() => setPaying(false)} cart={cart} subtotal={subtotal} onPaid={onPaid} />
 
@@ -254,12 +361,16 @@ function EmptyState() {
 interface CartPanelProps {
   cart: CartLine[]
   subtotal: number
-  onQty: (id: number, qty: number) => void
+  stockOf: (id: string) => number
+  allowOversell: boolean
+  onQty: (id: string, qty: number) => void
   onClear: () => void
   onPay: () => void
 }
 
-function CartPanel({ cart, subtotal, onQty, onClear, onPay }: CartPanelProps) {
+function CartPanel({ cart, subtotal, stockOf, allowOversell, onQty, onClear, onPay }: CartPanelProps) {
+  // Stock can drop while items sit in the cart (e.g. a sale in another tab).
+  const blocked = !allowOversell && cart.some((l) => l.qty > stockOf(l.product.id))
   return (
     <>
       <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
@@ -274,6 +385,7 @@ function CartPanel({ cart, subtotal, onQty, onClear, onPay }: CartPanelProps) {
         {cart.length === 0 && <li className="p-8 text-center text-sm text-slate-400">Cart is empty</li>}
         {cart.map(({ product: p, qty }) => {
           const step = isFractionalUnit(p.unit) ? 0.25 : 1
+          const stock = stockOf(p.id)
           return (
             <li key={p.id} className="flex items-center gap-2 px-4 py-2.5">
               <div className="min-w-0 flex-1">
@@ -281,21 +393,32 @@ function CartPanel({ cart, subtotal, onQty, onClear, onPay }: CartPanelProps) {
                 <div className="text-xs text-slate-500">
                   {formatPeso(p.price)} / {p.unit}
                 </div>
+                {qty > stock && (
+                  <div className={`text-xs font-semibold ${allowOversell ? 'text-amber-600' : 'text-red-600'}`}>
+                    {stock <= 0 ? 'Out of stock' : `Only ${formatQty(stock)} in stock`}
+                  </div>
+                )}
               </div>
               <div className="flex items-center rounded-lg ring-1 ring-slate-300">
-                <button className="p-2 text-slate-600" onClick={() => onQty(p.id!, +(qty - step).toFixed(3))} aria-label="Decrease">
+                <button className="p-2 text-slate-600" onClick={() => onQty(p.id, +(qty - step).toFixed(3))} aria-label="Decrease">
                   <Icon name="minus" className="h-4 w-4" />
                 </button>
                 <input
                   type="number"
                   inputMode="decimal"
                   min={0}
+                  max={allowOversell ? undefined : stock}
                   step={step}
                   value={qty}
-                  onChange={(e) => onQty(p.id!, Math.max(0, +e.target.value))}
+                  onChange={(e) => onQty(p.id, Math.max(0, +e.target.value))}
                   className="w-12 [appearance:textfield] bg-transparent text-center text-sm outline-none [&::-webkit-inner-spin-button]:appearance-none"
                 />
-                <button className="p-2 text-slate-600" onClick={() => onQty(p.id!, +(qty + step).toFixed(3))} aria-label="Increase">
+                <button
+                  className="p-2 text-slate-600 disabled:opacity-30"
+                  disabled={!allowOversell && qty + step > stock}
+                  onClick={() => onQty(p.id, +(qty + step).toFixed(3))}
+                  aria-label="Increase"
+                >
                   <Icon name="plus" className="h-4 w-4" />
                 </button>
               </div>
@@ -309,7 +432,8 @@ function CartPanel({ cart, subtotal, onQty, onClear, onPay }: CartPanelProps) {
           <span className="text-slate-600">Total</span>
           <span className="text-2xl font-bold">{formatPeso(subtotal)}</span>
         </div>
-        <button className="btn-primary w-full py-3.5 text-lg" disabled={cart.length === 0} onClick={onPay}>
+        {blocked && <p className="text-sm text-red-600">Reduce the items marked in red to continue.</p>}
+        <button className="btn-primary w-full py-3.5 text-lg" disabled={cart.length === 0 || blocked} onClick={onPay}>
           Pay
         </button>
       </div>
@@ -336,11 +460,11 @@ const bills = [20, 50, 100, 200, 500, 1000]
 
 function PaymentModal({ open, onClose, cart, subtotal, onPaid }: PaymentModalProps) {
   const settings = useSettings()
-  const customers = useLiveQuery(() => db.customers.orderBy('name').toArray(), []) ?? []
+  const customers = useCollection<Customer>(() => fsQuery(col('customers'), orderBy('name')), []) ?? []
   const [method, setMethod] = useState<PaymentMethod>('cash')
   const [tendered, setTendered] = useState('')
   const [reference, setReference] = useState('')
-  const [customerId, setCustomerId] = useState<number | ''>('')
+  const [customerId, setCustomerId] = useState('')
   const [newCustomer, setNewCustomer] = useState('')
   const [discountType, setDiscountType] = useState<DiscountType>('none')
   const [discountRef, setDiscountRef] = useState('')
@@ -376,10 +500,10 @@ function PaymentModal({ open, onClose, cart, subtotal, onPaid }: PaymentModalPro
     try {
       let cid = customerId || undefined
       if (method === 'utang' && !cid && newCustomer.trim()) {
-        cid = await db.customers.add({ name: newCustomer.trim(), phone: '', balance: 0, createdAt: Date.now() })
+        cid = addCustomer(newCustomer.trim())
       }
       const sale = await checkout({
-        items: cart.map(({ product: p, qty }) => ({ productId: p.id!, name: p.name, unit: p.unit, price: p.price, cost: p.cost, qty })),
+        items: cart.map(({ product: p, qty }) => ({ productId: p.id, name: p.name, unit: p.unit, price: p.price, cost: p.cost, qty })),
         discountType,
         discountRef: discountRef.trim() || undefined,
         discount,
@@ -502,7 +626,7 @@ function PaymentModal({ open, onClose, cart, subtotal, onPaid }: PaymentModalPro
         {method === 'utang' && (
           <div className="space-y-2">
             <label className="label" htmlFor="cust">Customer</label>
-            <select id="cust" className="input" value={customerId} onChange={(e) => setCustomerId(e.target.value ? +e.target.value : '')}>
+            <select id="cust" className="input" value={customerId} onChange={(e) => setCustomerId(e.target.value)}>
               <option value="">— New customer —</option>
               {customers.map((c) => (
                 <option key={c.id} value={c.id}>
